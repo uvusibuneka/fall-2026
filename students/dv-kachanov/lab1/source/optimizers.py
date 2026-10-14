@@ -15,46 +15,27 @@ class Optimizer(ABC):
             p.zero_grad()
 
 
-class SGD(Optimizer):
-    def __init__(
-        self,
-        params,
-        lr=0.01,
-        weight_decay=0.0
-    ):
-        super().__init__(params)
-
-        self.lr = lr
-        self.weight_decay = weight_decay
-
-    def step(self):
-        for p in self.params:
-            grad = p.grad.copy()
-
-            if self.weight_decay != 0.0:
-                regularization = self.weight_decay * p.data
-                regularization[0] = 0.0
-                grad += regularization
-
-            p.data -= (
-                self.lr
-                * grad
-            )
-
-
 class SGDMomentum(Optimizer):
+    """Стохастический градиент с инерцией (лекция 1).
+
+    v := gamma * v + (1 - gamma) * grad ~L(w, x_i)
+    w := w - h * v
+
+    Регуляризация здесь НЕ добавляется: штраф tau/2 * ||w||^2
+    входит в граф функции потерь ~L, поэтому grad уже содержит
+    слагаемое tau * w по всем компонентам, включая w_0.
+    """
+
     def __init__(
         self,
         params,
-        lr=0.01,
-        momentum=0.9,
-        weight_decay=0.0
+        h=0.01,
+        gamma=0.9
     ):
         super().__init__(params)
 
-        self.lr = lr
-        self.momentum = momentum
-        self.weight_decay = weight_decay
+        self.h = h
+        self.gamma = gamma
 
         self.velocity = [
             np.zeros_like(
@@ -68,21 +49,15 @@ class SGDMomentum(Optimizer):
         for i, p in enumerate(self.params):
             grad = p.grad.copy()
 
-            if self.weight_decay != 0.0:
-                regularization = self.weight_decay * p.data
-                regularization[0] = 0.0
-                grad += regularization
-
             self.velocity[i] = (
-                self.momentum
+                self.gamma
                 * self.velocity[i]
                 +
-                (1.0 - self.momentum)
+                (1.0 - self.gamma)
                 * grad
             )
 
             p.data -= (
-                self.lr
+                self.h
                 * self.velocity[i]
             )
-            

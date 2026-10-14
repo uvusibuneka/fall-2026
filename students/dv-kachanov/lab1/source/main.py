@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -6,6 +7,13 @@ sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent
+
+EPOCHS = int(os.environ.get("LAB1_EPOCHS", "100"))
+MULTISTART_N = int(os.environ.get("LAB1_MULTISTART_N", "10"))
+
+import matplotlib
+
+matplotlib.use("Agg")
 
 import pandas as pd
 
@@ -26,7 +34,9 @@ columns = [
 df = pd.read_csv(url, names=columns)
 
 
-# реализовать вычисление отступа объекта (визуализировать, проанализировать);
+# Канон обозначений — лекция 1: X^l = {(x_i, y_i)}, y_i in {-1, +1};
+# a(x, w) = sign(<w, x>); M_i(w) = g(x_i, w) * y_i;
+# Q(M) = (1 - M)^2; Q(w) = SUM_i L(w, x_i) -> min_w (сумма без 1/l).
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -53,8 +63,9 @@ X_train = (X_train - mean) / std
 X_test = (X_test - mean) / std
 
 
-X_train = np.column_stack((np.ones(len(X_train)), X_train))
-X_test = np.column_stack((np.ones(len(X_test)), X_test))
+# Константный признак f_0(x) = -1 (лекция 1, модель нейрона МакКаллока-Питтса).
+X_train = np.column_stack((-np.ones(len(X_train)), X_train))
+X_test = np.column_stack((-np.ones(len(X_test)), X_test))
 
 
 def g(X: Tensor, w: Tensor) -> Tensor:
@@ -65,22 +76,43 @@ def a(X: Tensor, w: Tensor) -> np.ndarray:
     return np.where(g(X, w).data >= 0, 1.0, -1.0)
 
 
-def M(X: Tensor, y: Tensor, w: Tensor) -> Tensor:
+def M_i(X: Tensor, y: Tensor, w: Tensor) -> Tensor:
+    """Отступ M_i(w) = g(x_i, w) * y_i; M_i(w) < 0 <=> ошибка на x_i."""
     return g(X, w) * y
 
 
-def L(X: np.ndarray, y: np.ndarray, w: Tensor) -> np.ndarray:
-    return a(Tensor(X), w) != y
+def err_rate(X: np.ndarray, y: np.ndarray, w: Tensor) -> float:
+    """Доля ошибок (бинарная потеря, НЕ эмпирический риск Q)."""
+    return float(np.mean(a(Tensor(X), w) != y))
 
 
 def Q(X: np.ndarray, y: np.ndarray, w: Tensor) -> float:
-    return L(X, y, w).mean()
+    """Эмпирический риск Q(w) = SUM_i (1 - M_i(w))^2 (сумма без 1/l)."""
+    margins = y * (X @ w.data)
+    return float(np.sum((1.0 - margins) ** 2))
 
 
-def quadratic_loss(X: Tensor, y: Tensor, w: Tensor) -> Tensor:
-    margin = M(X, y, w)
+def tilde_L(x_i: Tensor, y_i: Tensor, w: Tensor, tau: float) -> Tensor:
+    """Регуляризованная потеря одного объекта в графе автодифференцирования:
+
+    ~L(w, x_i) = L(w, x_i) + tau/2 * ||w||^2,
+    L(w, x_i) = Q(M_i) = (1 - M_i)^2, M_i = <w, x_i> * y_i.
+
+    Штраф tau/2 * SUM_{j=0}^{n} w_j^2 считается внутри графа по ВСЕМ
+    компонентам, включая w_0, поэтому grad содержит слагаемое tau * w
+    и шаг w := w - h * grad эквивалентен w := w(1 - h*tau) - h*grad L.
+    """
+    margin = M_i(x_i, y_i, w)
     residual = 1.0 + (-margin)
-    return (residual * residual).mean()
+    loss = (residual * residual).sum()
+    penalty = (w * w).sum() * (tau / 2.0)
+    return loss + penalty
+
+
+def per_object_tilde_L(x: np.ndarray, label: float, w: np.ndarray, tau: float) -> float:
+    """То же ~L(w, x_i), но числом (для инициализации оценки Q)."""
+    margin = float(x @ w) * label
+    return float((1.0 - margin) ** 2 + (tau / 2.0) * float(w @ w))
 
 
 def plot_margins(X: np.ndarray, y: np.ndarray, w: Tensor):
@@ -109,43 +141,79 @@ def analyze_margins(X: np.ndarray, y: np.ndarray, w: Tensor):
     print("Максимальный отступ:", margins.max())
 
 
-# реализовать вычисление градиента функции потерь;
+# Рекуррентная оценка функционала (экспоненциальное скользящее среднее).
 
-def grad(result: Tensor, w: Tensor) -> np.ndarray:
-    result.backward()
-    return w.grad.copy()
-
-
-# реализовать рекуррентную оценку функционала качества;
-
-def recursive_Q(previous_Q, current_loss, lambda_=0.01):
+def recursive_Q(previous_Q, xi, lam):
+    """Q := lam * xi + (1 - lam) * Q, xi := ~L(w, x_i)."""
     if previous_Q is None:
-        return current_loss
+        return xi
 
-    return lambda_ * current_loss + (1.0 - lambda_) * previous_Q
+    return lam * xi + (1.0 - lam) * previous_Q
 
 
-# реализовать метод стохастического градиентного спуска с инерцией;
+def init_Q(X, y, w: Tensor, tau: float, rng, subset_size=50) -> float:
+    """Q := среднее ~L(w, x_i) по случайному подмножеству (лекция 1, шаг 2 SG)."""
+    subset_size = min(subset_size, len(X))
+    idx = rng.choice(len(X), size=subset_size, replace=False)
+    values = [
+        per_object_tilde_L(X[k], float(y[k]), w.data, tau)
+        for k in idx
+    ]
+    return float(np.mean(values))
+
+
+# Порядок предъявления объектов (лекция 1).
+
+def sample_order(rng, margins: np.ndarray, mode: str, mu_plus=1.0, mu_minus=-1.0, delta=0.1):
+    """Порядок предъявления объектов.
+
+    shuffling: равномерная перетасовка (попеременно объекты разных классов
+    в среднем за счет перемешивания).
+
+    margin: вероятностное предпочтение объектов с малым M_i (больше ошибка)
+    и малым |M_i| (меньше уверенность): вес u_i = (mu_plus - M_i) / (|M_i| + delta),
+    объекты с M_i > mu_plus ("хорошие") и M_i < mu_minus ("выбросы")
+    в текущей эпохе вообще не предъявляются. Параметры mu_plus, mu_minus
+    подбираются; delta = 0.1 фиксирует вес уверенности при M_i = 0.
+    """
+    if mode == "shuffling":
+        return rng.permutation(len(margins))
+
+    if mode != "margin":
+        raise ValueError("Неизвестный способ предъявления объектов")
+
+    eligible = np.where((margins >= mu_minus) & (margins <= mu_plus))[0]
+    if len(eligible) == 0:
+        return np.empty(0, dtype=int)
+
+    m = margins[eligible]
+    u = (mu_plus - m) / (np.abs(m) + delta)
+    u = np.maximum(u, 0.0)
+    if u.sum() <= 0.0:
+        u = np.ones_like(u)
+    p = u / u.sum()
+    return rng.choice(eligible, size=len(eligible), replace=False, p=p)
+
+
+# Стохастический градиент с инерцией (лекция 1):
+# v := gamma * v + (1 - gamma) * grad ~L(w, x_i); w := w - h * v.
 
 from optimizers import SGDMomentum
 
 
-def train_sgd_momentum(X, y, w, epochs=100, lr=0.01, momentum=0.9, weight_decay=0.0, lambda_=0.01, order_mode="random", random_state=42):
+def train_sgd_momentum(X, y, w, h=0.01, gamma=0.9, tau=0.001, lam=None, epochs=100, order_mode="shuffling", mu_plus=1.0, mu_minus=-1.0, random_state=42):
     rng = np.random.default_rng(random_state)
+    if lam is None:
+        lam = 1.0 / len(X)
 
-    optimizer = SGDMomentum([w], lr=lr, momentum=momentum, weight_decay=weight_decay)
+    optimizer = SGDMomentum([w], h=h, gamma=gamma)
 
-    quality = None
+    Q_estimate = init_Q(X, y, w, tau, rng)
     history = []
 
     for epoch in range(epochs):
-        if order_mode == "random":
-            order = rng.permutation(len(X))
-        elif order_mode == "margin":
-            margins = y * (X @ w.data)
-            order = np.argsort(np.abs(margins))
-        else:
-            raise ValueError("Неизвестный способ предъявления объектов")
+        margins = y * (X @ w.data)
+        order = sample_order(rng, margins, order_mode, mu_plus=mu_plus, mu_minus=mu_minus)
 
         for i in order:
             x_i = Tensor(X[i:i + 1])
@@ -153,107 +221,81 @@ def train_sgd_momentum(X, y, w, epochs=100, lr=0.01, momentum=0.9, weight_decay=
 
             optimizer.zero_grad()
 
-            loss = quadratic_loss(x_i, y_i, w)
+            xi = tilde_L(x_i, y_i, w, tau)
 
-            loss.backward()
+            xi.backward()
             optimizer.step()
 
-            quality = recursive_Q(quality, loss.data.item(), lambda_)
+            Q_estimate = recursive_Q(Q_estimate, float(xi.data), lam)
 
-        history.append(quality)
+        history.append(Q_estimate)
 
     return w, history
 
 
-# реализовать L2 регуляризацию;
+# Скорейший градиентный спуск (лекция 1):
+# L(w - h * grad L(w, x_i), x_i) -> min_h по ОДНОМУ объекту;
+# при квадратичной потере h* = ||x_i||^{-2}.
+# Шаг делается по регуляризованному градиенту grad ~L(w, x_i)
+# (эквивалент w := w(1 - h*tau) - h*grad L), h* — из формулы лекции
+# для квадратичной потери.
 
-def l2_regularization(w: Tensor, weight_decay: float) -> float:
-    return 0.5 * weight_decay * np.sum(w.data[1:] ** 2)
+def train_steepest(X, y, w, tau=0.001, lam=None, epochs=100, random_state=42):
+    rng = np.random.default_rng(random_state)
+    if lam is None:
+        lam = 1.0 / len(X)
 
-
-# реализовать скорейший градиентный спуск;
-
-def find_best_step(X, y, w, gradient, weight_decay):
-    steps = np.logspace(-5, 0, 20)
-
-    original_weights = w.data.copy()
-
-    best_step = steps[0]
-    best_loss = float("inf")
-
-    for step in steps:
-        w.data = original_weights - step * gradient
-
-        loss = quadratic_loss(Tensor(X), Tensor(y), w)
-
-        regularization = l2_regularization(w, weight_decay)
-        loss_value = loss.data.item() + regularization
-
-        if loss_value < best_loss:
-            best_loss = loss_value
-            best_step = step
-
-    w.data = original_weights
-
-    return best_step
-
-
-def train_steepest(X, y, w, epochs=100, weight_decay=0.001, lambda_=0.01):
-    quality = None
+    Q_estimate = init_Q(X, y, w, tau, rng)
     history = []
 
     for epoch in range(epochs):
-        w.zero_grad()
-        loss = quadratic_loss(Tensor(X), Tensor(y), w)
-        loss.backward()
+        order = rng.permutation(len(X))
 
-        gradient = w.grad.copy()
-        regularization = weight_decay * w.data
-        regularization[0] = 0.0
-        gradient += regularization
+        for i in order:
+            x_i = Tensor(X[i:i + 1])
+            y_i = Tensor(y[i:i + 1])
 
-        step = find_best_step(X, y, w, gradient, weight_decay)
-        w.data -= step * gradient
+            w.zero_grad()
 
-        quality = recursive_Q(quality, loss.data.item(), lambda_)
+            xi = tilde_L(x_i, y_i, w, tau)
+            xi.backward()
 
-        history.append(quality)
+            gradient = w.grad.copy()
+            h_star = 1.0 / float(X[i] @ X[i])
+            w.data -= h_star * gradient
+
+            Q_estimate = recursive_Q(Q_estimate, float(xi.data), lam)
+
+        history.append(Q_estimate)
 
     return w, history
 
 
-# реализовать предъявление объектов по модулю отступа;
+# Обучение линейного классификатора на датасете Pima Indians Diabetes.
 
-def margin_order(X, y, w):
-    margins = y * (X @ w.data)
-    return np.argsort(np.abs(margins))
+from weights import zeros_init, random_init, correlation_init
 
+h = 0.01
+gamma = 0.9
+tau = 0.001
+lam = 1.0 / len(X_train)
+print(f"h = {h}, gamma = {gamma}, tau = {tau}, lam = {lam:.6f} (1/l, l = {len(X_train)})")
 
-# обучить линейный классификатор на выбранном датасете;
+# Обучение со случайным предъявлением (shuffling), случайная инициализация.
 
-from weights import random_init
+w = Tensor(random_init(X_train.shape[1], rng=np.random.default_rng(42)))
 
-#     обучить со случайным предъявлением;
-
-initial_w = random_init(X_train.shape[1], rng=np.random.default_rng(42))
-
-w = Tensor(initial_w)
-
-w, history = train_sgd_momentum(X_train, y_train, w, epochs=100, lr=0.01, momentum=0.9, weight_decay=0.001, order_mode="random")
+w, history = train_sgd_momentum(X_train, y_train, w, h=h, gamma=gamma, tau=tau, lam=lam, epochs=EPOCHS, order_mode="shuffling")
 
 
-#     обучить с инициализацией весов через корреляцию;
+# Обучение с инициализацией весов через корреляцию (точная дробь).
 
-from weights import correlation_init
+w_correlation = Tensor(correlation_init(X_train, y_train))
 
-correlation_w = correlation_init(X_train, y_train)
-
-w_correlation = Tensor(correlation_w)
-
-w_correlation, history_correlation = train_sgd_momentum(X_train, y_train, w_correlation, epochs=100, lr=0.01, momentum=0.9, weight_decay=0.001, order_mode="random")
+w_correlation, history_correlation = train_sgd_momentum(X_train, y_train, w_correlation, h=h, gamma=gamma, tau=tau, lam=lam, epochs=EPOCHS, order_mode="shuffling")
 
 
-#     обучить со случайной инициализацией весов через мультистарт;
+# Обучение со случайной инициализацией весов через мультистарт.
 
 best_multistart_w = None
 best_multistart_Q = float("inf")
@@ -261,12 +303,10 @@ best_multistart_history = None
 
 rng = np.random.default_rng(42)
 
-for start in range(10):
-    initial_w = random_init(X_train.shape[1], rng=rng)
+for start in range(MULTISTART_N):
+    current_w = Tensor(random_init(X_train.shape[1], rng=rng))
 
-    current_w = Tensor(initial_w)
-
-    current_w, current_history = train_sgd_momentum(X_train, y_train, current_w, epochs=100, lr=0.01, momentum=0.9, weight_decay=0.001, order_mode="random", random_state=start)
+    current_w, current_history = train_sgd_momentum(X_train, y_train, current_w, h=h, gamma=gamma, tau=tau, lam=lam, epochs=EPOCHS, order_mode="shuffling", random_state=start)
 
     current_Q = Q(X_train, y_train, current_w)
 
@@ -276,23 +316,22 @@ for start in range(10):
         best_multistart_history = current_history
 
 
-#     обучить с предъявлением объектов по модулю отступа;
+# Обучение с вероятностным предъявлением по отступу (малые M_i и |M_i|,
+# отсечения mu_plus / mu_minus), нулевая инициализация.
 
-initial_w = random_init(X_train.shape[1], rng=np.random.default_rng(42))
+w_margin = Tensor(zeros_init(X_train.shape[1]))
 
-w_margin = Tensor(initial_w)
-
-w_margin, history_margin = train_sgd_momentum(X_train, y_train, w_margin, epochs=100, lr=0.01, momentum=0.9, weight_decay=0.001, order_mode="margin")
-
-
-initial_w = random_init(X_train.shape[1], rng=np.random.default_rng(42))
-
-w_steepest = Tensor(initial_w)
-
-w_steepest, history_steepest = train_steepest(X_train, y_train, w_steepest, epochs=100, weight_decay=0.001)
+w_margin, history_margin = train_sgd_momentum(X_train, y_train, w_margin, h=h, gamma=gamma, tau=tau, lam=lam, epochs=EPOCHS, order_mode="margin", mu_plus=1.0, mu_minus=-1.0)
 
 
-# оценить качество классификации;
+# Скорейший спуск h* = ||x_i||^{-2} по одному объекту, нулевая инициализация.
+
+w_steepest = Tensor(zeros_init(X_train.shape[1]))
+
+w_steepest, history_steepest = train_steepest(X_train, y_train, w_steepest, tau=tau, lam=lam, epochs=EPOCHS)
+
+
+# Оценка качества классификации.
 
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
@@ -311,6 +350,7 @@ def evaluate(X, y, w, name):
     print("Precision:", precision)
     print("Recall:", recall)
     print("F1:", f1)
+    print("Q (train sum):", Q(X_train, y_train, w))
 
     return {
         "model": name,
@@ -330,7 +370,7 @@ results.append(evaluate(X_test, y_test, w_margin, "Margin presentation"))
 results.append(evaluate(X_test, y_test, w_steepest, "Steepest gradient descent"))
 
 
-# Визуализировать и проанализировать отступы;
+# Визуализировать и проанализировать отступы.
 
 custom_models = [
     ("SGD Momentum", w),
@@ -360,7 +400,7 @@ analyze_margins(X_test, y_test, best_w)
 plot_margins(X_test, y_test, best_w)
 
 
-# сравнить лучшую реализацию с эталонной;
+# Сравнить лучшую реализацию с эталонной.
 
 from sklearn.linear_model import RidgeClassifier
 
@@ -387,7 +427,7 @@ print("Recall:", reference_result["recall"])
 print("F1:", reference_result["f1"])
 
 
-# Итоговая таблица результатов;
+# Итоговая таблица результатов.
 
 results_df = pd.DataFrame(results)
 
@@ -396,7 +436,7 @@ print("Итоговые результаты:")
 print(results_df.to_string(index=False))
 
 
-# Визуализировать рекуррентную оценку функционала качества;
+# Визуализировать рекуррентную оценку функционала качества.
 
 plt.figure(figsize=(10, 5))
 
@@ -408,7 +448,8 @@ plt.plot(history_steepest, label="Steepest")
 
 plt.xlabel("Эпоха")
 plt.ylabel("Q")
-plt.title("Рекуррентная оценка функционала качества")
+plt.yscale("log")
+plt.title("Рекуррентная оценка функционала качества (лог. шкала)")
 plt.legend()
 plt.grid()
 
@@ -416,4 +457,4 @@ plt.savefig(OUTPUT_DIR / "quality.png")
 plt.close()
 
 
-# подготовить отчет. - см. README
+# Подготовить отчет. - см. README

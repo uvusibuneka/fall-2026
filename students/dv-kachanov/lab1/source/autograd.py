@@ -1,5 +1,6 @@
 import numpy as np
 
+
 class Tensor:
     def __init__(self, data):
         self.data = np.asarray(data, dtype=float)
@@ -124,6 +125,9 @@ class Tensor:
 
         return result
 
+    def __rmul__(self, other):
+        return self * other
+
     def __matmul__(self, other):
 
         if not isinstance(other, Tensor):
@@ -217,6 +221,27 @@ class Tensor:
         result._op = _backward
 
         return result
+
+    def sum(self):
+        result = Tensor(
+            np.sum(self.data)
+        )
+
+        result._prev = (self,)
+
+        def _backward():
+            self.grad += (
+                np.ones_like(
+                    self.data,
+                    dtype=float
+                )
+                * result.grad
+            )
+
+        result._op = _backward
+
+        return result
+
 
 def _unbroadcast(grad, shape):
     grad = np.asarray(grad, dtype=float)
